@@ -737,7 +737,11 @@ def resolve_model_class(auto_model, config):
 def _is_family_text_decoder(parent_model_type, text_model_type):
     # True only for the family's own text variant (gemma3 -> gemma3_text); a generic
     # reused decoder (llava -> llama) would load random weights, so keep the full model.
-    return bool(parent_model_type) and str(text_model_type).startswith(parent_model_type)
+    parent_model_type = str(parent_model_type or "").lower()
+    text_model_type = str(text_model_type or "").lower()
+    if parent_model_type == "mistral3" and text_model_type == "ministral3":
+        return True
+    return bool(parent_model_type) and text_model_type.startswith(parent_model_type)
 
 
 def _get_text_only_config(model_config, model_name):
