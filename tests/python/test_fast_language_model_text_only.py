@@ -10,6 +10,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LOADER_PATH = REPO_ROOT / "unsloth" / "models" / "loader.py"
 VISION_PATH = REPO_ROOT / "unsloth" / "models" / "vision.py"
+LLAMA_PATH = REPO_ROOT / "unsloth" / "models" / "llama.py"
 UTILS_PATH = REPO_ROOT / "unsloth" / "models" / "_utils.py"
 
 
@@ -117,6 +118,11 @@ def test_text_only_helper_rejects_configs_without_text_submodel():
 
     with pytest.raises(ValueError, match = "Cannot load vision-only as text-only"):
         helper(VisionOnlyConfig(), "vision-only")
+
+
+def test_resolved_text_only_is_forwarded_to_vllm():
+    for path in (LLAMA_PATH, VISION_PATH):
+        assert "language_model_only = text_only," in _source(path)
 
 
 def test_fast_language_model_forwards_text_only_to_fast_model():
