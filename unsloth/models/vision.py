@@ -1291,6 +1291,7 @@ class FastBaseModel:
                     use_bitsandbytes = load_in_4bit,
                     unsloth_vllm_standby = unsloth_vllm_standby,
                     is_vision_model = is_vlm_config,
+                    language_model_only = text_only,
                     fp8_mode = fp8_mode,
                 )
                 for allowed_arg in allowed_args:
