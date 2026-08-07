@@ -86,7 +86,7 @@ def test_pad_token_default_routed_through_inner_tokenizer():
 
 
 def test_pad_rewrite_noop_without_bare_pad_block():
-    # Older TRL (the pinned <=0.24.0 range) has no bare pad_token block; the
+    # Older TRL releases in the supported range have no bare pad_token block; the
     # rewrite must only touch pad_token_id and leave everything else intact.
     rewrite = _load_pad_rewriter()
     init_src = (

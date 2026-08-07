@@ -224,6 +224,37 @@ def PatchRL(FastLanguageModel):
                     use_gradient_checkpointing = use_gradient_checkpointing,
                 )
 
+    # Patch the canonical exports as well as modules which already imported the
+    # helper. Experimental trainers such as TRL's SDFT live outside
+    # ``trl.trainer`` and otherwise retain the stock unwrap context, whose
+    # gradient_checkpointing_enable() call replaces Unsloth's smart checkpoint
+    # function after every native rollout.
+    unsloth_unwrap_model_for_generation._unsloth_generation_wrapper = True
+    for _module_name in ("trl.models", "trl.models.utils"):
+        try:
+            _module = importlib.import_module(_module_name)
+            if hasattr(_module, "unwrap_model_for_generation"):
+                setattr(
+                    _module,
+                    "unwrap_model_for_generation",
+                    unsloth_unwrap_model_for_generation,
+                )
+        except (ImportError, AttributeError):
+            pass
+
+    for _module_name, _module in list(sys.modules.items()):
+        if _module is None or not _module_name.startswith("trl."):
+            continue
+        try:
+            if getattr(_module, "unwrap_model_for_generation", None) is unwrap_model_for_generation:
+                setattr(
+                    _module,
+                    "unwrap_model_for_generation",
+                    unsloth_unwrap_model_for_generation,
+                )
+        except (AttributeError, TypeError):
+            pass
+
     from transformers import Trainer
     from transformers.trainer_pt_utils import nested_detach
 
@@ -325,21 +356,6 @@ def PatchRL(FastLanguageModel):
 
         return (loss, logits, labels)
 
-    import trl.trainer
-
-    trainers = dir(trl.trainer)
-    trainers = [x for x in trainers if x.endswith("_trainer")]
-    unwrap = "unwrap_model_for_generation"
-    for trainer in trainers:
-        try:
-            current_trainer = getattr(trl.trainer, trainer)
-        except:
-            continue
-        if hasattr(current_trainer, unwrap):
-            try:
-                setattr(current_trainer, unwrap, unsloth_unwrap_model_for_generation)
-            except:
-                continue
     Trainer.prediction_step = unsloth_prediction_step
 
 
