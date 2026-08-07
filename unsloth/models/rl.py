@@ -25,6 +25,7 @@ import os
 import re
 import sys
 from contextlib import contextmanager
+from functools import partial
 from unsloth_zoo.compiler import create_new_function
 from unsloth_zoo.log import logger
 from unsloth_zoo.logging_utils import PatchRLStatistics
@@ -92,6 +93,214 @@ def vLLMSamplingParams(**kwargs):
     sampling_params = SamplingParams(**kwargs)
     sampling_params._set_kwargs = kwargs
     return sampling_params
+
+
+def _sdft_restore_env(name, previous):
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
+
+
+def _sdft_output_head(model):
+    while hasattr(model, "module"):
+        model = model.module
+    head = model.get_output_embeddings()
+    if head is None or not hasattr(head, "weight"):
+        raise TypeError("SDFT top-k optimization requires a linear output embedding")
+    return head
+
+
+def _sdft_completion_hidden(self, model, input_ids, attention_mask, logits_to_keep):
+    """Run an Unsloth CausalLM forward while returning hidden states in ``.logits``."""
+    previous = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
+    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+    try:
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "use_cache": False,
+        }
+        if "logits_to_keep" in self.model_kwarg_keys:
+            model_inputs["logits_to_keep"] = logits_to_keep + 1
+        hidden = model(**model_inputs).logits
+    finally:
+        _sdft_restore_env("UNSLOTH_RETURN_HIDDEN_STATES", previous)
+
+    head = _sdft_output_head(self.accelerator.unwrap_model(model))
+    if hidden.shape[-1] != head.weight.shape[-1]:
+        return None
+    return hidden[:, :-1, :][:, -logits_to_keep:, :]
+
+
+def _sdft_topk_chunk_loss(
+    student_hidden,
+    teacher_hidden,
+    student_weight,
+    teacher_weight,
+    student_bias,
+    teacher_bias,
+    completion_ids,
+    temperature,
+    topk,
+    alpha,
+    add_tail,
+):
+    """Top-k SDFT objective for one token chunk without retaining vocab logits."""
+    import torch.nn.functional as F
+
+    student_logits = F.linear(student_hidden.to(student_weight.dtype), student_weight, student_bias)
+    with torch.no_grad():
+        teacher_logits = F.linear(teacher_hidden.to(teacher_weight.dtype), teacher_weight, teacher_bias)
+    if temperature != 1.0:
+        student_logits = student_logits / temperature
+        teacher_logits = teacher_logits / temperature
+
+    student_lse = torch.logsumexp(student_logits, dim=-1, keepdim=True)
+    student_topk, topk_indices = torch.topk(student_logits, k=topk, dim=-1)
+    student_topk = student_topk - student_lse
+    with torch.no_grad():
+        teacher_topk = torch.gather(teacher_logits, dim=-1, index=topk_indices)
+        teacher_topk = teacher_topk - torch.logsumexp(teacher_logits, dim=-1, keepdim=True)
+
+    if add_tail:
+        def add_tail_bucket(log_probs):
+            log_mass = torch.logsumexp(log_probs, dim=-1, keepdim=True).clamp(max=-1e-7)
+            return torch.cat((log_probs, torch.log(-torch.expm1(log_mass))), dim=-1)
+
+        student_topk = add_tail_bucket(student_topk)
+        teacher_topk = add_tail_bucket(teacher_topk)
+    else:
+        student_topk = student_topk - torch.logsumexp(student_topk, dim=-1, keepdim=True)
+        teacher_topk = teacher_topk - torch.logsumexp(teacher_topk, dim=-1, keepdim=True)
+
+    if alpha == 0.0:
+        divergence = F.kl_div(student_topk, teacher_topk, reduction="none", log_target=True)
+    elif alpha == 1.0:
+        divergence = F.kl_div(teacher_topk, student_topk, reduction="none", log_target=True)
+    else:
+        alpha_t = student_topk.new_tensor(alpha)
+        mixture = torch.logsumexp(
+            torch.stack((student_topk + torch.log1p(-alpha_t), teacher_topk + torch.log(alpha_t))),
+            dim=0,
+        )
+        kl_teacher = F.kl_div(mixture, teacher_topk, reduction="none", log_target=True)
+        kl_student = F.kl_div(mixture, student_topk, reduction="none", log_target=True)
+        divergence = torch.lerp(kl_student, kl_teacher, alpha)
+
+    selected = torch.gather(student_logits, -1, completion_ids.unsqueeze(-1)).squeeze(-1)
+    return divergence.sum(-1), selected - student_lse.squeeze(-1)
+
+
+def _sdft_efficient_topk_loss(self, model, inputs):
+    """Compute TRL's top-k SDFT loss with token-chunked, recomputed projections."""
+    completion_ids = inputs["completion_ids"]
+    completion_mask = inputs["completion_mask"]
+    logits_to_keep = completion_ids.size(1)
+    loss_mask = completion_mask
+    if self.num_loss_tokens_to_skip > 0:
+        positions = torch.arange(completion_mask.size(1), device=completion_mask.device).unsqueeze(0)
+        loss_mask = completion_mask * (positions >= self.num_loss_tokens_to_skip).long()
+
+    student_ids = torch.cat((inputs["prompt_ids"], completion_ids), dim=1)
+    student_mask = torch.cat((inputs["prompt_mask"], completion_mask), dim=1)
+    student_hidden = _sdft_completion_hidden(
+        self, model, student_ids, student_mask, logits_to_keep
+    )
+    if student_hidden is None:
+        return None
+
+    with torch.no_grad(), self._get_teacher_context_for_self_distillation():
+        teacher_hidden = _sdft_completion_hidden(
+            self,
+            self.teacher_model,
+            inputs["teacher_input_ids"],
+            inputs["teacher_attention_mask"],
+            logits_to_keep,
+        )
+    if teacher_hidden is None:
+        return None
+
+    student_head = _sdft_output_head(self.accelerator.unwrap_model(model))
+    teacher_head = _sdft_output_head(self.accelerator.unwrap_model(self.teacher_model))
+    student_bias = getattr(student_head, "bias", None)
+    teacher_bias = getattr(teacher_head, "bias", None)
+    # A token chunk, unlike a vocabulary chunk, preserves exact logsumexp and
+    # top-k semantics. Checkpointing prevents each [chunk, vocab] projection
+    # from being retained for backward; it is recomputed on demand instead.
+    chunk_size = max(1, int(os.environ.get("UNSLOTH_SDFT_LOGIT_CHUNK_SIZE", "128")))
+    per_token_loss, student_logps = [], []
+    checkpoint = torch.utils.checkpoint.checkpoint
+    for start in range(0, logits_to_keep, chunk_size):
+        end = min(start + chunk_size, logits_to_keep)
+        chunk_fn = partial(
+            _sdft_topk_chunk_loss,
+            student_weight=student_head.weight,
+            teacher_weight=teacher_head.weight,
+            student_bias=student_bias,
+            teacher_bias=teacher_bias,
+            completion_ids=completion_ids[:, start:end],
+            temperature=self.temperature,
+            topk=self.args.distillation_topk,
+            alpha=self.args.distillation_alpha,
+            add_tail=self.args.distillation_add_tail,
+        )
+        chunk_loss, chunk_logps = checkpoint(
+            chunk_fn,
+            student_hidden[:, start:end],
+            teacher_hidden[:, start:end],
+            use_reentrant=False,
+        )
+        per_token_loss.append(chunk_loss)
+        student_logps.append(chunk_logps)
+    per_token_loss = torch.cat(per_token_loss, dim=1)
+    student_logps = torch.cat(student_logps, dim=1)
+
+    old_logps = inputs.get("old_per_token_logps")
+    if self.args.distillation_is_clip is not None and old_logps is not None:
+        from trl.experimental.sdft.sdft_trainer import apply_importance_sampling_clipping
+        per_token_loss = apply_importance_sampling_clipping(
+            per_token_loss, student_logps, old_logps, self.args.distillation_is_clip
+        )
+
+    denominators = loss_mask.sum(-1).clamp(min=1.0)
+    loss = ((per_token_loss * loss_mask).sum(-1) / denominators).mean()
+    mean_loss = (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+    mode = "train" if model.training else "eval"
+    self._log_self_distillation_metric(
+        mode, self.accelerator.gather(mean_loss.detach()).mean().item()
+    )
+    return loss
+
+
+def patch_trl_sdft_topk():
+    """Install the opt-in-by-capability exact top-k path on experimental TRL SDFT."""
+    try:
+        from trl.experimental.sdft.sdft_trainer import SDFTTrainer
+    except ImportError:
+        return
+    original = SDFTTrainer.compute_loss
+    if getattr(original, "_unsloth_sdft_topk", False):
+        return
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if (
+            not return_outputs
+            and os.environ.get("UNSLOTH_DISABLE_SDFT_TOPK_OPTIMIZATION", "0") != "1"
+            and not self.use_teacher_server
+            and not self.use_liger_loss
+            and self.args.distillation_mode == "topk_logits"
+            and self.args.distillation_topk is not None
+        ):
+            loss = _sdft_efficient_topk_loss(self, model, inputs)
+            if loss is not None:
+                scale = self.current_gradient_accumulation_steps if self.model.training else 1.0
+                return loss / scale
+        return original(self, model, inputs, return_outputs, num_items_in_batch)
+
+    compute_loss._unsloth_sdft_topk = True
+    compute_loss._unsloth_original = original
+    SDFTTrainer.compute_loss = compute_loss
 
 
 def _maybe_prepare_vllm_for_resume(trainer):
@@ -2366,6 +2575,7 @@ def patch_trl_vllm_generation():
 def PatchFastRL(algorithm = None, FastLanguageModel = None):
     if FastLanguageModel is not None:
         PatchRL(FastLanguageModel)
+        patch_trl_sdft_topk()
     # Under UNSLOTH_ALLOW_CPU=1 (CPU-only CI), skip TRL trainer rewriting so
     # downstream `inspect.getsource(trl.SFTTrainer)` drift detectors see the
     # pristine upstream class, not the compiled Unsloth* wrappers.
