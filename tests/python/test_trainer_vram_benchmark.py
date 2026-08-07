@@ -61,6 +61,7 @@ def test_print_table_contains_memory_and_status(capsys):
                 "batch_size": 1,
                 "lora_rank": 8,
                 "prompt_length": 512,
+                "teacher_prompt_length": 768,
                 "completion_length": 1024,
                 "total_length": 1536,
                 "status": "pass",

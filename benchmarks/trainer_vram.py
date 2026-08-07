@@ -76,6 +76,7 @@ def _worker_command(args: argparse.Namespace, case: dict) -> list[str]:
         **case,
         "model": str(Path(args.model).resolve()),
         "prompt_length": args.prompt_length,
+        "teacher_prompt_length": args.teacher_prompt_length or args.prompt_length + 8,
         "num_generations": args.num_generations,
         "distillation_topk": args.distillation_topk,
         "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
@@ -112,7 +113,8 @@ def run_case(args: argparse.Namespace, case: dict) -> dict:
     return {
         **case,
         "prompt_length": args.prompt_length,
-        "total_length": args.prompt_length + case["completion_length"],
+        "teacher_prompt_length": args.teacher_prompt_length or args.prompt_length + 8,
+        "total_length": max(args.prompt_length, args.teacher_prompt_length or args.prompt_length + 8) + case["completion_length"],
         "status": "error",
         "error": f"worker exited {completed.returncode} without a result",
         "worker_output_tail": completed.stdout[-4000:],
@@ -124,13 +126,14 @@ def _format_gib(value) -> str:
 
 
 def print_table(results: list[dict]) -> None:
-    headers = ("trainer", "batch", "rank", "prompt", "completion", "total", "status", "peak alloc", "peak reserved", "seconds")
+    headers = ("trainer", "batch", "rank", "prompt", "teacher", "completion", "total", "status", "peak alloc", "peak reserved", "seconds")
     rows = [headers]
     for result in results:
         rows.append(
             (
                 result["trainer"], str(result["batch_size"]), str(result["lora_rank"]),
-                str(result["prompt_length"]), str(result["completion_length"]),
+                str(result["prompt_length"]), str(result["teacher_prompt_length"]),
+                str(result["completion_length"]),
                 str(result["total_length"]), result["status"],
                 _format_gib(result.get("peak_allocated_bytes")),
                 _format_gib(result.get("peak_reserved_bytes")),
@@ -195,6 +198,25 @@ def exact_text(tokenizer, target: int) -> str:
     raise RuntimeError(f"could not construct text with exactly {target} tokens")
 
 
+def exact_teacher_context(tokenizer, prompt: str, target: int) -> str:
+    """Build context so ``prompt + context`` follows the exact SDFT length."""
+    if _token_count(tokenizer, prompt) > target:
+        raise ValueError("teacher prompt cannot be shorter than the student prompt")
+    if _token_count(tokenizer, f"{prompt}\n\n") == target:
+        return ""
+    for unit in (" fact", " evidence", " context", " x"):
+        count = max(1, target - _token_count(tokenizer, prompt))
+        for _ in range(12):
+            context = unit * max(1, count)
+            actual = _token_count(tokenizer, f"{prompt}\n\n{context}")
+            if actual == target:
+                return context
+            count += target - actual
+            if count < 1:
+                break
+    raise RuntimeError(f"could not construct teacher prompt with exactly {target} tokens")
+
+
 def _load_model(config: dict):
     os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
     os.environ["UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE"] = "1"
@@ -203,7 +225,7 @@ def _load_model(config: dict):
     mode = config["load_mode"]
     model, tokenizer = FastModel.from_pretrained(
         model_name=config["model"],
-        max_seq_length=config["prompt_length"] + config["completion_length"],
+        max_seq_length=max(config["prompt_length"], config["teacher_prompt_length"]) + config["completion_length"],
         load_in_4bit=mode == "4bit",
         load_in_8bit=False,
         load_in_16bit=mode == "16bit",
@@ -331,11 +353,13 @@ def _build_trainer(config: dict, model, tokenizer, output_dir: str):
 
     from trl.experimental.sdft import SDFTConfig, SDFTTrainer
 
+    privileged_context = exact_teacher_context(tokenizer, prompt, config["teacher_prompt_length"])
+
     return SDFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=Dataset.from_dict(
-            {"prompt": prompts, "privileged_context": ["Known correct context."] * len(prompts)}
+            {"prompt": prompts, "privileged_context": [privileged_context] * len(prompts)}
         ),
         args=SDFTConfig(
             **common,
@@ -348,7 +372,7 @@ def _build_trainer(config: dict, model, tokenizer, output_dir: str):
             distillation_add_tail=False,
             distillation_is_clip=None,
             num_generations=1,
-            max_prompt_length=config["prompt_length"],
+            max_prompt_length=config["teacher_prompt_length"],
             max_completion_length=config["completion_length"],
             generation_kwargs=generation_kwargs,
             use_vllm=True,
@@ -362,8 +386,8 @@ def worker(config: dict) -> int:
     import torch
 
     result = {
-        **{key: config[key] for key in ("trainer", "batch_size", "lora_rank", "prompt_length", "completion_length")},
-        "total_length": config["prompt_length"] + config["completion_length"],
+        **{key: config[key] for key in ("trainer", "batch_size", "lora_rank", "prompt_length", "teacher_prompt_length", "completion_length")},
+        "total_length": max(config["prompt_length"], config["teacher_prompt_length"]) + config["completion_length"],
     }
     try:
         torch.manual_seed(config["seed"])
@@ -411,6 +435,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model", help="existing local model directory")
     result.add_argument("--trainers", default="sft,grpo,sdft", help="comma-separated trainer names")
     result.add_argument("--prompt-length", type=int, default=512, help="fixed synthetic prompt length")
+    result.add_argument("--teacher-prompt-length", type=int, help="SDFT prompt plus privileged context; defaults to prompt length + 8")
     result.add_argument("--completion-lengths", default="128,512,1024,2048,4096", help="comma-separated sweep")
     result.add_argument("--lora-ranks", default="8", help="comma-separated sweep")
     result.add_argument("--batch-sizes", default=None, help="optional comma-separated sweep; defaults are 1/2/1")
