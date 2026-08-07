@@ -86,6 +86,44 @@ def test_sdft_compute_loss_gets_unsloth_topk_wrapper():
     assert getattr(SDFTTrainer.compute_loss, "_unsloth_sdft_topk", False)
 
 
+def test_sdft_ministral3_uses_decoder_without_materializing_logits():
+    import unsloth  # noqa: F401
+    from types import SimpleNamespace
+    from unsloth.models.rl import _sdft_completion_hidden
+
+    expected = torch.randn(1, 9, 6)
+
+    class Ministral:
+        config = SimpleNamespace(text_config=SimpleNamespace(model_type="ministral3"))
+        output_head = torch.nn.Linear(6, 37, bias=False)
+
+        def get_output_embeddings(self):
+            return self.output_head
+
+        def set_output_embeddings(self, head):
+            self.output_head = head
+
+        def __call__(self, **kwargs):
+            assert kwargs["use_cache"] is False
+            assert isinstance(self.output_head, torch.nn.Identity)
+            return SimpleNamespace(logits=expected[:, -(kwargs["logits_to_keep"]):])
+
+    model = Ministral()
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(unwrap_model=lambda candidate: candidate),
+        model_kwarg_keys={"logits_to_keep"},
+    )
+    actual = _sdft_completion_hidden(
+        trainer,
+        model,
+        torch.ones(1, 9, dtype=torch.long),
+        torch.ones(1, 9, dtype=torch.long),
+        4,
+    )
+    torch.testing.assert_close(actual, expected[:, 4:8])
+    assert model.output_head is Ministral.output_head
+
+
 def test_sdft_vllm_generation_reuses_engine_and_live_lora():
     import unsloth  # noqa: F401
     from trl.generation.vllm_generation import VLLMGeneration

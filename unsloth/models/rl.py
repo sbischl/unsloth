@@ -111,8 +111,35 @@ def _sdft_output_head(model):
     return head
 
 
+def _sdft_is_ministral3(model):
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", config)
+    return getattr(text_config, "model_type", None) == "ministral3"
+
+
 def _sdft_completion_hidden(self, model, input_ids, attention_mask, logits_to_keep):
     """Run an Unsloth CausalLM forward while returning hidden states in ``.logits``."""
+    unwrapped_model = self.accelerator.unwrap_model(model)
+    if _sdft_is_ministral3(unwrapped_model):
+        # Transformers' Ministral3ForCausalLM does not implement Unsloth's
+        # UNSLOTH_RETURN_HIDDEN_STATES convention. Calling its normal forward
+        # would materialize [batch, completion, vocab] logits before we could
+        # detect the fallback. Temporarily replace only the output projection
+        # with an identity so the normal, compiled CausalLM route is preserved.
+        # This is local to the synchronous forward and restored even on error.
+        output_head = _sdft_output_head(unwrapped_model)
+        unwrapped_model.set_output_embeddings(torch.nn.Identity())
+        try:
+            hidden = model(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                use_cache = False,
+                logits_to_keep = logits_to_keep + 1,
+            ).logits
+        finally:
+            unwrapped_model.set_output_embeddings(output_head)
+        return hidden[:, :-1, :][:, -logits_to_keep:, :]
+
     previous = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
     try:
@@ -294,6 +321,7 @@ def patch_trl_sdft_topk():
         ):
             loss = _sdft_efficient_topk_loss(self, model, inputs)
             if loss is not None:
+                self._unsloth_sdft_topk_used = True
                 scale = self.current_gradient_accumulation_steps if self.model.training else 1.0
                 return loss / scale
         return original(self, model, inputs, return_outputs, num_items_in_batch)

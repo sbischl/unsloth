@@ -88,6 +88,13 @@ def _worker_command(args: argparse.Namespace, case: dict) -> list[str]:
 
 def run_case(args: argparse.Namespace, case: dict) -> dict:
     env = os.environ.copy()
+    repo_root = Path(__file__).resolve().parents[1]
+    local_paths = [str(repo_root)]
+    zoo_root = repo_root.parent / "unsloth-zoo"
+    if zoo_root.is_dir():
+        local_paths.append(str(zoo_root))
+    if env.get("PYTHONPATH"):
+        local_paths.append(env["PYTHONPATH"])
     env.update(
         {
             "HF_HUB_OFFLINE": "1",
@@ -96,6 +103,7 @@ def run_case(args: argparse.Namespace, case: dict) -> dict:
             "UNSLOTH_VLLM_STANDBY": "1",
             "UNSLOTH_VLLM_STANDBY_UTIL_OVERRIDE": "1",
             "TRL_EXPERIMENTAL_SILENCE": "1",
+            "PYTHONPATH": os.pathsep.join(local_paths),
         }
     )
     with tempfile.TemporaryDirectory(prefix="unsloth-trainer-vram-worker-") as worker_dir:
@@ -413,6 +421,12 @@ def worker(config: dict) -> int:
             )
             if train_result.global_step != 1 or not math.isfinite(train_result.training_loss):
                 raise RuntimeError("trainer did not complete one finite optimizer step")
+            if config["trainer"] == "sdft":
+                result["unsloth_topk_optimized"] = bool(
+                    getattr(trainer, "_unsloth_sdft_topk_used", False)
+                )
+                if not result["unsloth_topk_optimized"]:
+                    raise RuntimeError("SDFT silently fell back to the full-logits loss path")
             _assert_lora_changed(model, snapshot)
             if getattr(model, "_trainer_vram_sleeping", False):
                 model.vllm_engine.wake_up()
