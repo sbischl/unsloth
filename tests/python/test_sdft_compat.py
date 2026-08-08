@@ -86,6 +86,52 @@ def test_sdft_compute_loss_gets_unsloth_topk_wrapper():
     assert getattr(SDFTTrainer.compute_loss, "_unsloth_sdft_topk", False)
 
 
+def test_sdft_lora_ema_teacher_starts_from_student():
+    import unsloth  # noqa: F401
+    from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+    from trl.experimental.sdft.teacher_sync import PEFTAdapterEMACallback
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, values):
+            return self.proj(values)
+
+    model = get_peft_model(
+        TinyModel(),
+        LoraConfig(r=2, lora_alpha=2, target_modules=["proj"]),
+    )
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.copy_(torch.randn_like(parameter))
+
+    expected = {
+        key: value.clone() for key, value in get_peft_model_state_dict(model).items()
+    }
+    callback = PEFTAdapterEMACallback(model=model)
+    callback._initialize_teacher_adapter()
+
+    student = get_peft_model_state_dict(model, adapter_name="default")
+    teacher = get_peft_model_state_dict(model, adapter_name="teacher")
+    assert model.active_adapter == "default"
+    for key in expected:
+        torch.testing.assert_close(student[key], expected[key])
+        torch.testing.assert_close(teacher[key], expected[key])
+        torch.testing.assert_close(callback.shadow_weights[key], expected[key])
+
+
+def test_sdft_non_lora_ema_path_is_unchanged():
+    import unsloth  # noqa: F401
+    from trl.experimental.sdft.teacher_sync import SyncTeacherModelCallback
+
+    assert not getattr(
+        SyncTeacherModelCallback.on_step_end, "_unsloth_sdft_ema", False
+    )
+
+
 def test_sdft_ministral3_uses_decoder_without_materializing_logits():
     import unsloth  # noqa: F401
     from types import SimpleNamespace

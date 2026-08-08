@@ -331,6 +331,50 @@ def patch_trl_sdft_topk():
     SDFTTrainer.compute_loss = compute_loss
 
 
+def patch_trl_sdft_ema_teacher():
+    """Initialize TRL's LoRA EMA teacher from the loaded student adapter."""
+    try:
+        from peft import set_peft_model_state_dict
+        from trl.experimental.sdft.teacher_sync import PEFTAdapterEMACallback
+    except ImportError:
+        return
+
+    original = PEFTAdapterEMACallback._initialize_teacher_adapter
+    if getattr(original, "_unsloth_sdft_ema", False):
+        return
+
+    def _initialize_teacher_adapter(self):
+        was_initialized = self._initialized
+        original(self)
+        if was_initialized or not self._initialized:
+            return
+
+        student_state = self._get_student_state_dict()
+        teacher_state = {
+            key: value.detach().clone() for key, value in student_state.items()
+        }
+        model = (
+            self.accelerator.unwrap_model(self.model)
+            if self.accelerator is not None
+            else self.model
+        )
+        active_adapter = model.active_adapter
+        model.set_adapter(self.teacher_adapter_name)
+        try:
+            set_peft_model_state_dict(
+                model,
+                teacher_state,
+                adapter_name=self.teacher_adapter_name,
+            )
+        finally:
+            model.set_adapter(active_adapter)
+        self.shadow_weights = teacher_state
+
+    _initialize_teacher_adapter._unsloth_sdft_ema = True
+    _initialize_teacher_adapter._unsloth_original = original
+    PEFTAdapterEMACallback._initialize_teacher_adapter = _initialize_teacher_adapter
+
+
 def _maybe_prepare_vllm_for_resume(trainer):
     if not torch.cuda.is_available():
         return
@@ -2604,6 +2648,7 @@ def PatchFastRL(algorithm = None, FastLanguageModel = None):
     if FastLanguageModel is not None:
         PatchRL(FastLanguageModel)
         patch_trl_sdft_topk()
+        patch_trl_sdft_ema_teacher()
     # Under UNSLOTH_ALLOW_CPU=1 (CPU-only CI), skip TRL trainer rewriting so
     # downstream `inspect.getsource(trl.SFTTrainer)` drift detectors see the
     # pristine upstream class, not the compiled Unsloth* wrappers.
