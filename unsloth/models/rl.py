@@ -336,6 +336,7 @@ def patch_trl_sdft_ema_teacher():
     try:
         from peft import set_peft_model_state_dict
         from trl.experimental.sdft.teacher_sync import PEFTAdapterEMACallback
+        import unsloth_zoo.vllm_utils as vllm_utils
     except ImportError:
         return
 
@@ -373,6 +374,22 @@ def patch_trl_sdft_ema_teacher():
     _initialize_teacher_adapter._unsloth_sdft_ema = True
     _initialize_teacher_adapter._unsloth_original = original
     PEFTAdapterEMACallback._initialize_teacher_adapter = _initialize_teacher_adapter
+
+    load_lora = vllm_utils.load_lora
+    if not getattr(load_lora, "_unsloth_sdft_ema", False):
+        def load_lora_without_ema(model, *args, **kwargs):
+            request = load_lora(model, *args, **kwargs)
+            tensors = getattr(request, "lora_tensors", None)
+            if tensors is not None:
+                request.lora_tensors = {
+                    key: value for key, value in tensors.items()
+                    if ".teacher." not in key
+                }
+            return request
+
+        load_lora_without_ema._unsloth_sdft_ema = True
+        load_lora_without_ema._unsloth_original = load_lora
+        vllm_utils.load_lora = load_lora_without_ema
 
 
 def _maybe_prepare_vllm_for_resume(trainer):
