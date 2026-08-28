@@ -448,9 +448,20 @@ class FP8BlockQuantLinear(torch.autograd.Function):
         return grad_X, None, None
 
 
-@torch_compile
 def fp8_torch_block_quant_forward(X, weight, weight_scale):
     return FP8BlockQuantLinear.apply(X, weight, weight_scale)
+
+
+# Torch 2.11 compiles the FP8 custom-autograd wrapper into a graph whose
+# blockwise matmuls are drastically slower on Ada GPUs.  Keep the Triton
+# kernel eager on 2.11+ while allowing the surrounding model to stay compiled.
+if Version(torch.__version__) >= Version("2.11.0"):
+    fp8_torch_block_quant_forward = torch.compiler.disable(
+        fp8_torch_block_quant_forward,
+        recursive = True,
+    )
+else:
+    fp8_torch_block_quant_forward = torch_compile(fp8_torch_block_quant_forward)
 
 
 class FbgemmFp8Linear_matmul(torch.autograd.Function):
