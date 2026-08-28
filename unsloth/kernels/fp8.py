@@ -111,7 +111,9 @@ def weight_dequant_block(
         triton.cdiv(N, meta["BLOCK_SIZE"]),
     )
     with _fp8_triton_device_context(x):
-        weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE = block_size)
+        torch.library.wrap_triton(weight_dequant_kernel)[grid](
+            x, s, y, M, N, BLOCK_SIZE = block_size
+        )
     return y
 
 
@@ -166,7 +168,9 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, tor
         return (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)
 
     with _fp8_triton_device_context(x):
-        act_quant_kernel[grid](x, y, s, BLOCK_SIZE = block_size)
+        torch.library.wrap_triton(act_quant_kernel)[grid](
+            x, y, s, BLOCK_SIZE = block_size
+        )
     return y, s
 
 
@@ -292,7 +296,7 @@ def w8a8_block_fp8_matmul_triton(
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     with _fp8_triton_device_context(A):
-        _w8a8_block_fp8_matmul[grid](
+        torch.library.wrap_triton(_w8a8_block_fp8_matmul)[grid](
             A,
             B,
             C,
@@ -449,20 +453,72 @@ class FP8BlockQuantLinear(torch.autograd.Function):
         return grad_X, None, None
 
 
-def fp8_torch_block_quant_forward(X, weight, weight_scale):
-    return FP8BlockQuantLinear.apply(X, weight, weight_scale)
+@torch.library.triton_op("unsloth::fp8_block_quant_linear", mutates_args = ())
+def fp8_torch_block_quant_forward(
+    X: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    m, n = weight.shape
+    if weight_scale.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        weight_scale = weight_scale.to(torch.float32)
+    original_weight_scale = weight_scale
+    if weight_scale.numel() == 1:
+        block_size = [128, 128]
+        weight_scale = weight_scale.expand(
+            triton.cdiv(m, block_size[0]), triton.cdiv(n, block_size[1])
+        ).contiguous()
+    else:
+        p, q = weight_scale.shape
+        block_size = getattr(weight, "block_size", None) or getattr(
+            weight_scale, "block_size", [128, 128]
+        )
+        if triton.cdiv(m, block_size[0]) != p or triton.cdiv(n, block_size[1]) != q:
+            if triton.cdiv(m, block_size[0]) == q and triton.cdiv(n, block_size[1]) == p:
+                weight_scale = weight_scale.T
+                original_weight_scale = weight_scale
+            else:
+                raise ValueError("Weight and scale shapes are incompatible")
+    weight = weight.contiguous()
+    if X.shape[-1] % block_size[1] != 0:
+        W_deq = _blockwise_weight_dequant_any_shape(
+            weight, original_weight_scale, block_size, X.dtype
+        )
+        return torch_matmul(X, W_deq.T).to(X.dtype)
+    qinput, scale = act_quant(X, block_size[1])
+    return fp8_block_matmul(
+        qinput, weight, scale, weight_scale, block_size, output_dtype = X.dtype
+    ).to(X.dtype)
 
 
-# Torch 2.11 compiles the FP8 custom-autograd wrapper into a graph whose
-# blockwise matmuls are drastically slower on Ada GPUs.  Keep the Triton
-# kernel eager on 2.11+ while allowing the surrounding model to stay compiled.
-if Version(torch.__version__) >= Version("2.11.0"):
-    fp8_torch_block_quant_forward = torch.compiler.disable(
-        fp8_torch_block_quant_forward,
-        recursive = True,
+def _fp8_block_quant_linear_setup_context(ctx, inputs, output):
+    X, weight, weight_scale = inputs
+    ctx.save_for_backward(weight, weight_scale)
+
+
+def _fp8_block_quant_linear_backward(ctx, grad_output):
+    weight, weight_scale = ctx.saved_tensors
+    m, n = weight.shape
+    if weight_scale.numel() == 1:
+        block_size = [128, 128]
+    else:
+        block_size = getattr(weight, "block_size", None) or getattr(
+            weight_scale, "block_size", [128, 128]
+        )
+        p, q = weight_scale.shape
+        if triton.cdiv(m, block_size[0]) == q and triton.cdiv(n, block_size[1]) == p:
+            weight_scale = weight_scale.T
+    W_deq = _blockwise_weight_dequant_any_shape(
+        weight, weight_scale, block_size, grad_output.dtype
     )
-else:
-    fp8_torch_block_quant_forward = torch_compile(fp8_torch_block_quant_forward)
+    grad_X = torch_matmul(grad_output, W_deq)
+    return grad_X, None, None
+
+
+fp8_torch_block_quant_forward.register_autograd(
+    _fp8_block_quant_linear_backward,
+    setup_context = _fp8_block_quant_linear_setup_context,
+)
 
 
 class FbgemmFp8Linear_matmul(torch.autograd.Function):
